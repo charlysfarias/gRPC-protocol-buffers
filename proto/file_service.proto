@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package fileservice;
+
+import "google/protobuf/timestamp.proto";
+
+service FileService {
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+  rpc Upload(stream UploadRequest) returns (TransferStatus);
+  rpc Download(DownloadRequest) returns (stream DownloadResponse);
+}
+
+message ListFilesRequest {}
+
+message FileInfo {
+  string name = 1;
+  uint64 size_bytes = 2;
+  google.protobuf.Timestamp modified_at = 3;
+}
+
+message ListFilesResponse {
+  repeated FileInfo files = 1;
+  TransferStatus status = 2;
+}
+
+message UploadMetadata {
+  string filename = 1;
+  uint64 expected_size = 2;
+  string sha256 = 3;
+}
+
+message FileChunk {
+  bytes data = 1;
+}
+
+message UploadRequest {
+  oneof payload {
+    UploadMetadata metadata = 1;
+    FileChunk chunk = 2;
+  }
+}
+
+message DownloadRequest {
+  string filename = 1;
+}
+
+message DownloadMetadata {
+  string filename = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+}
+
+message DownloadChunk {
+  bytes data = 1;
+}
+
+message TransferStatus {
+  bool success = 1;
+  string message = 2;
+  uint64 bytes_transferred = 3;
+  string sha256 = 4;
+}
+
+message DownloadResponse {
+  oneof payload {
+    DownloadMetadata metadata = 1;
+    DownloadChunk chunk = 2;
+    TransferStatus status = 3;
+  }
+}
