@@ -1,112 +1,223 @@
-# Equipe 08 — Transferência de arquivos com gRPC
+# Equipe 08 — Transferência e gerenciamento de arquivos com gRPC
 
-## 1. Objetivo e escopo
+Projeto da disciplina **CIN0143 — Introdução aos Sistemas Distribuídos e Redes de Computadores** (CIn/UFPE, 2026.2).
 
-O sistema implementa um serviço distribuído de armazenamento e transferência de arquivos usando gRPC e Protocol Buffers.
+Sistema distribuído cliente-servidor para armazenar, listar, enviar e baixar arquivos usando **gRPC** com **Protocol Buffers**. O upload usa *client-side streaming*, o download usa *server-side streaming*, e cada transferência é fragmentada em chunks e verificada por SHA-256 nas duas pontas.
 
-Operações:
-- `ListFiles`: consulta os arquivos disponíveis, com nome, tamanho em bytes e data de modificação.
-- `Upload`: recebe um arquivo por **client-side streaming**.
-- `Download`: transmite um arquivo por **server-side streaming**.
+> **Estado atual: Entrega 2 (Comunicação e Core).** Servidor e cliente de terminal funcionais, atendimento concorrente, logs estruturados e script de teste de concorrência. Interface gráfica e testes de carga ficam para as próximas entregas (ver [Roadmap](#13-roadmap)).
 
-O escopo desta primeira entrega contempla o contrato `.proto`, estratégia de fragmentação, armazenamento, índice em memória, validações, geração dos stubs e servidor funcional na porta TCP `50051`.
+## Sumário
+
+1. [Decisão tecnológica](#1-decisão-tecnológica)
+2. [Arquitetura](#2-arquitetura)
+3. [Contrato Protocol Buffers](#3-contrato-protocol-buffers)
+4. [Fragmentação e integridade](#4-fragmentação-e-integridade)
+5. [Estado central e armazenamento](#5-estado-central-e-armazenamento)
+6. [Validações e códigos de erro](#6-validações-e-códigos-de-erro)
+7. [Concorrência](#7-concorrência)
+8. [Logs](#8-logs)
+9. [Estrutura de pastas](#9-estrutura-de-pastas)
+10. [Instalação](#10-instalação)
+11. [Execução](#11-execução)
+12. [Testes](#12-testes)
+13. [Roadmap](#13-roadmap)
+
+---
+
+## 1. Decisão tecnológica
+
+| Escolha | Justificativa |
+|---|---|
+| **gRPC** (tecnologia sugerida) | Os três requisitos do tema são modos nativos do gRPC: chamada unária (listagem), *client streaming* (upload) e *server streaming* (download). O fluxo de chunks fica declarado no próprio contrato, sem protocolo de framing escrito à mão. |
+| **Protocol Buffers** | Serialização binária compacta. O campo `bytes` carrega o conteúdo cru do arquivo; em JSON seria preciso Base64, cerca de 33% a mais por chunk. O `.proto` é um contrato tipado do qual se geram os stubs de cliente e servidor. |
+| **HTTP/2** (transporte do gRPC) | Multiplexação: várias transferências simultâneas trafegam como *streams* independentes numa única conexão TCP. Também traz controle de fluxo (*backpressure*), *deadlines* e cancelamento propagados entre cliente e servidor. |
+| **Python 3.10+** com `grpcio` | Implementação oficial do gRPC, geração de stubs com `grpcio-tools`, e bibliotecas padrão suficientes para o domínio (`hashlib`, `pathlib`, `tempfile`, `threading`, `logging`). É a linguagem que toda a equipe domina, o que reduz o risco do cronograma. |
+
+**Alternativas consideradas:** REST com `multipart/form-data` não tem contrato de streaming tipado e exigiria Range/Chunked feitos à mão. WebSockets não têm contrato nem códigos de status padronizados. gRPC em Go teria desempenho melhor, mas com curva de aprendizado maior para a equipe.
 
 ## 2. Arquitetura
 
 ```text
-+----------------+       gRPC / HTTP/2       +----------------------+
-| Cliente Python | ------------------------> | Servidor gRPC :50051 |
-|                |                            |                      |
-| ListFiles      | <------------------------ | FileService          |
-| Upload stream  | ------------------------> | - valida metadados   |
-| Download      | <------------------------ | - recebe/envia chunks|
-+----------------+                            | - calcula SHA-256    |
-                                              +----------+-----------+
-                                                         |
-                                              +----------v-----------+
-                                              | storage/             |
-                                              | arquivos persistidos |
-                                              +----------------------+
+                      gRPC sobre HTTP/2 (TCP :50051)
++--------------------+                                +------------------------------+
+| Cliente (terminal) |  ListFiles   (unária)  ----->  | Servidor gRPC                |
+|  src/client.py     |  <-----  ListFilesResponse     |  src/server.py               |
+|                    |                                |                              |
+|  - calcula SHA-256 |  Upload  (client streaming)    |  FileService                 |
+|  - fragmenta 64KiB |  metadata, chunk, chunk ... -> |   - valida nome/tamanho/hash |
+|  - verifica hash   |  <-----  TransferStatus        |   - reserva nome             |
+|    no download     |                                |   - grava .tmp + fsync       |
+|                    |  Download (server streaming)   |   - publica com os.replace   |
+|                    |  <- metadata, chunk ..., status|   - logs estruturados        |
++--------------------+                                +--------------+---------------+
+                                                                     |
+  N clientes simultâneos (processos, máquinas      ThreadPoolExecutor (--workers)
+  ou streams num mesmo canal HTTP/2)                  + RLock no índice
+                                                                     |
+                                                      +--------------v---------------+
+                                                      | Índice em memória (dict)     |
+                                                      |  nome -> tamanho, data, hash |
+                                                      +--------------+---------------+
+                                                                     |
+                                                      +--------------v---------------+
+                                                      | storage/  (disco, persistente)|
+                                                      +------------------------------+
 ```
 
-O servidor mantém um índice em memória (`dict`) com nome, tamanho e instante de modificação. No início, o índice é reconstruído examinando os arquivos já persistidos no diretório `storage/`. O sistema de arquivos é a fonte persistente; o índice é uma estrutura auxiliar em memória.
+**Responsabilidades**
+
+- **Servidor (`src/server.py`):** expõe o serviço `FileService` e é o único dono da pasta `storage/`. Valida as requisições, mantém o índice em memória, recebe e envia chunks e registra logs de cada chamada.
+- **Cliente (`src/client.py`):** CLI com os comandos `list`, `upload` e `download`. Calcula o SHA-256 antes do envio e confere o hash e o tamanho no download antes de gravar o arquivo final.
+- **Logs (`src/log_config.py`):** formato de log `chave=valor` comum a servidor, cliente e testes.
+- **Contrato (`proto/file_service.proto`):** fonte única de verdade das mensagens e RPCs. Os stubs `file_service_pb2*.py` são gerados a partir dele.
 
 ## 3. Contrato Protocol Buffers
 
-O contrato está em `proto/file_service.proto`.
+Arquivo completo: [`proto/file_service.proto`](proto/file_service.proto).
 
-| RPC | Tipo | Responsabilidade |
-|---|---|---|
-| `ListFiles` | Unary | Retorna os metadados dos arquivos |
-| `Upload` | Client streaming | Recebe metadados e uma sequência de chunks |
-| `Download` | Server streaming | Envia metadados, chunks e status final |
+```protobuf
+service FileService {
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+  rpc Upload(stream UploadRequest) returns (TransferStatus);
+  rpc Download(DownloadRequest) returns (stream DownloadResponse);
+}
+```
 
-### Formato do upload
+| RPC | Tipo | Requisição | Resposta |
+|---|---|---|---|
+| `ListFiles` | Unária | `ListFilesRequest {}` | `ListFilesResponse { repeated FileInfo files }`, com `FileInfo = {name, size_bytes, modified_at (Timestamp)}` |
+| `Upload` | Client streaming | stream de `UploadRequest` (`oneof`: `metadata` ou `chunk`) | `TransferStatus {success, message, bytes_transferred, sha256}` |
+| `Download` | Server streaming | `DownloadRequest {filename}` | stream de `DownloadResponse` (`oneof`: `metadata`, `chunk` ou `status`) |
 
-A primeira mensagem do stream deve ser `UploadMetadata`, contendo:
-- `filename`: nome simples do arquivo;
-- `expected_size`: tamanho esperado em bytes;
-- `sha256`: hash SHA-256 calculado pelo cliente.
+**Sequência do upload**
 
-As mensagens seguintes são `FileChunk`, cada uma com até 64 KiB de dados. O servidor rejeita streams sem metadados, chunks antes dos metadados, tamanho excedente e divergência em relação ao tamanho declarado.
+1. `UploadMetadata {filename, expected_size, sha256}`: obrigatoriamente a primeira mensagem.
+2. Zero ou mais `FileChunk {data}`, cada um com até 64 KiB.
+3. O cliente fecha o stream; o servidor valida e responde um `TransferStatus` com o SHA-256 calculado por ele.
 
-### Formato do download
+**Sequência do download**
 
-O servidor envia, nesta ordem:
-1. `DownloadMetadata` com nome, tamanho e SHA-256;
-2. zero ou mais `DownloadChunk`;
-3. `TransferStatus` final.
+1. `DownloadMetadata {filename, size_bytes, sha256}`.
+2. Zero ou mais `DownloadChunk {data}`.
+3. `TransferStatus` final, com os bytes enviados e o hash.
 
-O cliente só considera o download concluído depois de verificar o tamanho recebido e comparar o SHA-256.
+Erros não vêm dentro dessas mensagens: o servidor encerra a chamada com um **código de status gRPC** (seção 6). O campo `status` removido de `ListFilesResponse` está marcado como `reserved` para que o número 2 nunca seja reutilizado com outro significado.
 
 ## 4. Fragmentação e integridade
 
-- **Tamanho do chunk:** 64 KiB (65.536 bytes).
-- **Metadados:** primeira mensagem do upload; primeira resposta do download.
-- **Tamanho máximo:** 100 MiB por arquivo.
-- **Integridade:** SHA-256 calculado sobre o conteúdo integral.
-- **Verificação:** o servidor compara o tamanho recebido com `expected_size` e o hash calculado com o hash informado. No download, o cliente repete as verificações.
-- **Persistência segura:** o upload é gravado em arquivo temporário no próprio diretório de armazenamento. Somente após as verificações o arquivo é movido atomicamente para o nome definitivo. Em caso de falha, o temporário é removido.
+| Item | Decisão |
+|---|---|
+| Tamanho do chunk | **64 KiB** (65.536 bytes), bem abaixo do limite padrão de 4 MiB por mensagem gRPC e com pouca memória por transferência |
+| Metadados | Primeira mensagem do upload e primeira resposta do download (`oneof`) |
+| Tamanho máximo | 100 MiB por arquivo (configurável com `--max-file-mb`) |
+| Integridade | SHA-256 do conteúdo integral, **obrigatório** no upload (64 caracteres hexadecimais) |
+| Verificação no upload | O servidor compara os bytes recebidos com `expected_size` e o hash calculado com o declarado. O cliente ainda confere o hash devolvido no `TransferStatus`. |
+| Verificação no download | O cliente compara os bytes recebidos com `size_bytes` e o hash calculado com o dos metadados. Só então renomeia o `.part` para o nome final. |
+| Publicação atômica | O upload é gravado em `storage/.upload-XXXX.tmp`, recebe `fsync` e só depois de validado é movido com `os.replace` (operação atômica) para o nome definitivo. Em qualquer falha ou cancelamento o temporário é apagado. Temporários órfãos de uma queda do servidor são removidos na inicialização. |
 
-O tamanho de 64 KiB reduz a necessidade de manter o arquivo inteiro em memória e limita o tamanho de cada mensagem. O valor pode ser ajustado conforme testes de desempenho e limites de mensagem do ambiente.
+A ordem dos chunks é garantida pelo próprio gRPC: dentro de um stream HTTP/2 as mensagens chegam na ordem em que foram enviadas, por isso não há número de sequência no `FileChunk`.
 
-## 5. Armazenamento e validações
+## 5. Estado central e armazenamento
 
-Estrutura física:
+- **Persistência:** a pasta `storage/` (configurável com `--storage`) guarda os arquivos com o nome definitivo, em uma estrutura plana.
+- **Índice em memória:** `dict[str, FileEntry]` com `size`, `mtime` e `sha256` de cada arquivo. É reconstruído a partir do disco quando o servidor sobe e atualizado a cada upload concluído.
+  - `ListFiles` responde só a partir do índice.
+  - `Download` usa o hash guardado, sem reler o arquivo para calculá-lo. Para arquivos que já existiam no disco, o hash é calculado no primeiro download e guardado.
+- **Reservas:** um `set` com os nomes que estão sendo enviados naquele momento. Um segundo upload com o mesmo nome é rejeitado na primeira mensagem, sem transferir nenhum byte.
+- **Sincronização:** um `threading.RLock` protege o índice e as reservas. Operações lentas (calcular hash, gravar em disco) são feitas **fora** do lock para não bloquear os outros clientes.
+- O servidor é o único dono de `storage/`. Arquivos copiados manualmente para a pasta com o servidor rodando só aparecem depois de reiniciar.
+
+## 6. Validações e códigos de erro
+
+| Situação | Código gRPC |
+|---|---|
+| Nome inválido: fora de `[A-Za-z0-9._ -]`, começando com `.`, contendo `/`, `\` ou `..` (path traversal), ou com mais de 200 caracteres | `INVALID_ARGUMENT` |
+| SHA-256 ausente ou malformado | `INVALID_ARGUMENT` |
+| Primeira mensagem não é metadado, stream vazio, ou mais bytes que o declarado | `INVALID_ARGUMENT` |
+| Arquivo inexistente no download | `NOT_FOUND` |
+| Nome já existe ou já está sendo enviado por outro cliente | `ALREADY_EXISTS` |
+| Arquivo acima do limite, ou limite de chamadas simultâneas atingido | `RESOURCE_EXHAUSTED` |
+| Faltam bytes ou o SHA-256 não confere | `DATA_LOSS` |
+| Prazo (`--timeout`) excedido | `DEADLINE_EXCEEDED` |
+| Servidor fora do ar | `UNAVAILABLE` |
+| Falha inesperada de disco | `INTERNAL` (o log do servidor guarda o traceback) |
+
+O cliente mostra uma mensagem curta (`Erro [NOT_FOUND]: Arquivo inexistente.`) e termina com código de saída `0` (sucesso), `1` (erro), `2` (uso incorreto) ou `130` (Ctrl+C).
+
+## 7. Concorrência
+
+- **Modelo de execução:** o servidor usa um `ThreadPoolExecutor` com `--workers` threads (padrão 10). Cada RPC de streaming ocupa uma thread do início ao fim da transferência, então até `--workers` transferências rodam em paralelo.
+- **Limite de chamadas:** `--max-concurrent` (padrão: igual a `--workers`) limita quantas chamadas o servidor aceita no total.
+  - Chamadas além do limite recebem `RESOURCE_EXHAUSTED` imediatamente, em vez de ficarem esperando sem aviso.
+  - Com `--max-concurrent` maior que `--workers`, as excedentes esperam numa fila por uma thread livre.
+- **Disputa pelo mesmo nome:** é resolvida pela reserva do nome (seção 5). Exatamente um cliente vence.
+- **Cancelamento e deadline:** se o cliente desiste ou o prazo estoura, o servidor detecta, registra `upload.cancelled` ou `download.cancelled`, apaga o temporário e libera o nome reservado.
+- **Porta exclusiva:** o servidor desativa `SO_REUSEPORT`. Sem isso, o gRPC permitiria que um segundo processo escutasse na mesma porta, e cada um teria o próprio índice, deixando os dados inconsistentes. Agora o segundo processo falha com "A porta já está em uso?".
+- **Encerramento gracioso:** Ctrl+C ou `SIGTERM` param de aceitar novas chamadas e dão 5 s para as transferências em andamento terminarem.
+
+## 8. Logs
+
+Servidor, cliente e testes escrevem no console em um formato `chave=valor` fácil de ler e de filtrar com `grep`:
 
 ```text
-equipe08_grpc/
+2026-11-22 20:57:48.774 INFO    [worker_0] server event=upload.start transfer=834c6d2b peer=ipv4:127.0.0.1:35374 filename=big4.bin expected_size=60000000
+2026-11-22 20:57:48.801 INFO    [worker_1] server event=upload.start transfer=5465525e peer=ipv4:127.0.0.1:35378 filename=big1.bin expected_size=60000000
+2026-11-22 20:57:49.590 INFO    [worker_0] server event=upload.done transfer=834c6d2b peer=ipv4:127.0.0.1:35374 filename=big4.bin bytes=60000000 chunks=916 sha256=bec43e828b38220c duration_ms=816.13 mib_s=70.11
+2026-11-22 21:03:12.076 WARNING [worker_0] server event=download.rejected transfer=2e8b91c4 peer=ipv4:127.0.0.1:46618 filename=nada.bin code=NOT_FOUND reason="Arquivo inexistente."
+2026-11-22 20:57:49.858 WARNING [worker_0] server event=download.cancelled transfer=bfdf675f peer=ipv4:127.0.0.1:35408 filename=big1.bin bytes=262144 total=60000000 duration_ms=43.62
+```
+
+- `[worker_N]`: thread do pool que atende a chamada; threads diferentes mostram a concorrência.
+- `transfer`: identificador curto que liga todas as linhas da mesma transferência.
+- `peer`: endereço do cliente.
+
+**Eventos do servidor**
+
+| Grupo | Eventos |
+|---|---|
+| Ciclo de vida | `server.started`, `server.stopping`, `server.stopped`, `server.bind_failed`, `index.rebuilt`, `storage.orphans_removed` |
+| Listagem | `list.start`, `list.done` |
+| Upload | `upload.open`, `upload.start`, `upload.progress` (25/50/75%), `upload.done`, `upload.rejected`, `upload.cancelled`, `upload.failed`, `upload.tempfile_removed` |
+| Download | `download.start`, `download.progress`, `download.done`, `download.rejected`, `download.cancelled`, `download.failed` |
+
+O nível de detalhe é ajustado com `--log-level` (`DEBUG`, `INFO`, `WARNING`, `ERROR`).
+
+## 9. Estrutura de pastas
+
+```text
+gRPC-protocol-buffers/
 ├── proto/
-│   └── file_service.proto
+│   └── file_service.proto        # contrato gRPC
 ├── src/
-│   ├── server.py
-│   └── client.py
-├── storage/       # criado automaticamente
-├── downloads/     # criado pelo cliente ao baixar
+│   ├── server.py                 # servidor gRPC (FileService)
+│   ├── client.py                 # cliente de terminal (list/upload/download)
+│   ├── log_config.py             # formato de log compartilhado
+│   ├── file_service_pb2.py       # gerado pelo protoc (não versionado)
+│   └── file_service_pb2_grpc.py  # gerado pelo protoc (não versionado)
+├── tests/
+│   └── concurrency_test.py       # N clientes simultâneos + verificação de integridade
+├── storage/                      # criado pelo servidor (não versionado)
+├── downloads/                    # criado pelo cliente (não versionado)
 ├── requirements.txt
 └── README.md
 ```
 
-Validações implementadas:
-- nome permitido por lista de caracteres; rejeita `..`, `/` e `\\`;
-- limite de 100 MiB;
-- rejeição de arquivo inexistente no download;
-- rejeição de nome duplicado no upload;
-- tamanho declarado versus tamanho recebido;
-- hash SHA-256;
-- gravação temporária e publicação somente após validação.
+## 10. Instalação
 
-## 6. Instalação e geração dos stubs
-
-Recomendado: Python 3.10 ou superior e ambiente virtual.
+Requisitos: **Python 3.10 ou superior** (confira com `python3 --version`).
 
 ```bash
-python -m venv .venv
+git clone https://github.com/charlysfarias/gRPC-protocol-buffers.git
+cd gRPC-protocol-buffers
+
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-A partir da raiz do projeto, gere os stubs:
+No Windows, ative o ambiente com `.venv\Scripts\activate`.
+
+Gere os stubs a partir do contrato. É preciso gerar de novo **sempre que o `.proto` mudar**:
 
 ```bash
 python -m grpc_tools.protoc \
@@ -116,45 +227,154 @@ python -m grpc_tools.protoc \
   ./proto/file_service.proto
 ```
 
-Isso gera:
-- `src/file_service_pb2.py`
-- `src/file_service_pb2_grpc.py`
+Isso cria `src/file_service_pb2.py` e `src/file_service_pb2_grpc.py`.
 
-## 7. Execução
+## 11. Execução
 
-Terminal 1 — servidor:
+Todos os comandos são executados a partir da raiz do projeto, com o ambiente virtual ativado.
+
+### Servidor
 
 ```bash
 python src/server.py
 ```
 
-O servidor ficará disponível em `localhost:50051`.
+| Opção | Padrão | Variável de ambiente | Descrição |
+|---|---|---|---|
+| `--host` | `0.0.0.0` | `FILESERVER_HOST` | Interface de escuta |
+| `-p`, `--port` | `50051` | `FILESERVER_PORT` | Porta TCP |
+| `-w`, `--workers` | `10` | `FILESERVER_WORKERS` | Threads que atendem chamadas simultâneas |
+| `--max-concurrent` | = `--workers` | — | Máximo de chamadas aceitas; excedentes recebem `RESOURCE_EXHAUSTED` |
+| `--max-file-mb` | `100` | `FILESERVER_MAX_FILE_MB` | Tamanho máximo por arquivo (MiB) |
+| `--storage` | `./storage` | `FILESERVER_STORAGE` | Pasta de armazenamento |
+| `--log-level` | `INFO` | — | `DEBUG`, `INFO`, `WARNING` ou `ERROR` |
 
-Terminal 2 — cliente:
+Exemplo: `python src/server.py -p 6000 -w 20 --max-concurrent 50 --storage /tmp/arquivos`.
+
+Para encerrar: **Ctrl+C**.
+
+### Cliente
+
+As opções globais vêm **antes** do comando:
 
 ```bash
-# Listar arquivos
-python src/client.py list
-
-# Enviar arquivo
-python src/client.py upload ./exemplo.pdf
-
-# Baixar arquivo
-python src/client.py download exemplo.pdf
+python src/client.py [-s HOST:PORTA] [-t SEGUNDOS] [--log-level NIVEL] COMANDO ...
 ```
 
-O diretório `storage/` é criado automaticamente. Os downloads são gravados em `downloads/`.
+| Comando | Exemplo | Descrição |
+|---|---|---|
+| `list` | `python src/client.py list` | Lista nome, tamanho e data dos arquivos |
+| `upload ARQUIVO [--as NOME]` | `python src/client.py upload ./relatorio.pdf` | Envia por client streaming; `--as` define outro nome no servidor |
+| `download NOME [-o PASTA]` | `python src/client.py download relatorio.pdf -o ~/Desktop` | Baixa por server streaming (padrão: `./downloads`) |
 
-## 8. Roteiro de testes para demonstração
+| Opção global | Padrão | Descrição |
+|---|---|---|
+| `-s`, `--server` | `localhost:50051` (env `FILESERVER_ADDRESS`) | Endereço do servidor |
+| `-t`, `--timeout` | sem limite | Deadline da chamada em segundos |
+| `--log-level` | `INFO` | Use `WARNING` para ver só o resultado |
 
-1. Iniciar o servidor e executar `list` com o armazenamento vazio.
-2. Enviar um arquivo pequeno e executar `list` novamente.
-3. Baixar o arquivo e comparar o conteúdo com o original (por exemplo, `sha256sum`).
-4. Tentar enviar novamente o mesmo nome e verificar a rejeição.
-5. Tentar baixar um nome inexistente e verificar o status de erro.
-6. Enviar arquivo acima do limite (100 MiB) e verificar a rejeição.
-7. Conferir que arquivos temporários não permanecem no armazenamento após uma transferência inválida.
+### Em duas máquinas
 
-## 9. Limitações e evolução
+Na máquina do servidor, descubra o IP (`ipconfig getifaddr en0` no macOS, `hostname -I` no Linux) e rode `python src/server.py`. Na outra máquina, na mesma rede:
 
-Esta versão é uma base acadêmica. O servidor usa canal gRPC sem TLS (`insecure_channel`) e não implementa autenticação, autorização, replicação, persistência de índice em banco de dados ou controle de concorrência distribuído entre múltiplas instâncias. Esses itens podem ser discutidos como evoluções futuras, conforme o escopo das próximas entregas.
+```bash
+python src/client.py -s 192.168.0.10:50051 list
+```
+
+O firewall precisa permitir a porta 50051.
+
+## 12. Testes
+
+### 12.1 Roteiro manual
+
+Com o servidor rodando em um terminal, execute no outro:
+
+```bash
+head -c 5000000 /dev/urandom > exemplo.bin
+
+python src/client.py list
+python src/client.py upload exemplo.bin
+python src/client.py list
+python src/client.py download exemplo.bin
+
+shasum -a 256 exemplo.bin downloads/exemplo.bin
+
+python src/client.py upload exemplo.bin
+python src/client.py download nao-existe.bin
+python src/client.py download ../etc/passwd
+python src/client.py -s localhost:59999 list
+```
+
+| Passo | Resultado esperado |
+|---|---|
+| 1ª listagem | `Nenhum arquivo disponível.` |
+| Upload | `Enviado: exemplo.bin (5000000 bytes, SHA-256 ...)` |
+| 2ª listagem | Tabela com o arquivo |
+| Download | `Baixado: downloads/exemplo.bin (5000000 bytes, SHA-256 verificado)` |
+| `shasum` (no Linux, `sha256sum`) | Os dois hashes são idênticos |
+| Upload repetido | `Erro [ALREADY_EXISTS]: Já existe um arquivo com esse nome.` |
+| Arquivo inexistente | `Erro [NOT_FOUND]: Arquivo inexistente.` |
+| Path traversal | `Erro: Nome de arquivo inválido: informe apenas o nome, sem diretórios.` |
+| Porta errada | `Erro [UNAVAILABLE]: Servidor indisponível em localhost:59999. ...` |
+
+**Limite de tamanho:** suba o servidor com `--max-file-mb 1` e envie um arquivo maior. O resultado esperado é `Erro [RESOURCE_EXHAUSTED]: Arquivo excede o tamanho máximo de 1048576 bytes.`
+
+**Cancelamento:** pressione Ctrl+C no meio do upload de um arquivo grande. O servidor registra `upload.cancelled` e não deixa `.tmp` em `storage/`.
+
+### 12.2 Teste de concorrência
+
+`tests/concurrency_test.py` dispara N clientes **ao mesmo tempo** (sincronizados por uma `threading.Barrier`). Cada um envia um arquivo aleatório, baixa de volta e confere o SHA-256. Ao final, o script mostra tempos (mínimo, média, p95, máximo), vazão agregada e **APROVADO** ou **REPROVADO** (código de saída `0` ou `1`).
+
+```bash
+python tests/concurrency_test.py -n 10 --size-mb 10
+python tests/concurrency_test.py -n 8 --shared-channel
+python tests/concurrency_test.py -n 8 --same-name
+```
+
+- **Primeiro comando:** 10 clientes, cada um com a própria conexão.
+- **`--shared-channel`:** todos usam uma única conexão HTTP/2, mostrando a multiplexação.
+- **`--same-name`:** todos disputam o mesmo nome; exatamente 1 deve vencer e os demais recebem `ALREADY_EXISTS`.
+
+| Opção | Padrão | Descrição |
+|---|---|---|
+| `-s`, `--server` | `localhost:50051` | Endereço do servidor |
+| `-n`, `--clients` | `10` | Clientes simultâneos |
+| `--size-mb` | `5` | Tamanho do arquivo de cada cliente |
+| `-t`, `--timeout` | `120` | Deadline por chamada (s) |
+| `--shared-channel` | desligado | Um único canal para todos |
+| `--same-name` | desligado | Testa a disputa pelo mesmo nome |
+| `--skip-download` | desligado | Só uploads |
+
+Exemplo de saída (10 clientes × 10 MiB):
+
+```text
+==============================================================================
+Resumo: 10 clientes, 10.0 MiB cada, canal próprio por cliente, modo nomes distintos
+==============================================================================
+OPERAÇÃO     OK  FALHA   MIN (s)  MÉDIA (s)   P95 (s)   MÁX (s)
+upload       10      0     0.453      0.530     0.542     0.542
+download     10      0     0.036      0.275     0.310     0.310
+Tempo total: 0.852 s | Vazão agregada: 234.73 MiB/s
+
+Verificação de integridade: APROVADO
+```
+
+Com mais clientes que `--max-concurrent`, os excedentes recebem `RESOURCE_EXHAUSTED` e o teste reprova, mostrando o limite em ação. Para que todos sejam atendidos via fila, suba o servidor com, por exemplo, `--max-concurrent 50`.
+
+Os arquivos de teste ficam em `storage/` com o prefixo `loadtest-`. Para limpar, pare o servidor e apague a pasta `storage/`.
+
+## 13. Roadmap
+
+| Entrega | Escopo | Status |
+|---|---|---|
+| 1 — Arquitetura e escopo | Tecnologia justificada, `.proto`, chunking e integridade, estado central, validações, servidor base em porta fixa | ✅ Concluída |
+| 2 — Comunicação e core | Listagem, upload e download funcionais, cliente de terminal, concorrência, logs estruturados, códigos de status gRPC, configuração por CLI, teste de concorrência | ✅ Concluída |
+| 3 — Evolução | Interface gráfica e testes de carga (por exemplo, com [`ghz`](https://ghz.sh)) | ⏳ Planejada |
+| 4 — Apresentação | Demonstração final | ⏳ 01 e 03/12/2026 |
+
+**Limitações conhecidas:**
+
+- Canal sem TLS (`insecure`).
+- Sem autenticação nem autorização.
+- Sem remoção de arquivos nem retomada de transferências interrompidas.
+- Uma única instância do servidor, sem replicação.
