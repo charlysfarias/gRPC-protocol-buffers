@@ -11,6 +11,13 @@ from log_config import ProgressLogger, log_event, setup_logging
 
 ADDRESS = "localhost:50051"
 CHUNK_SIZE = 64 * 1024
+USAGE = "Uso: python src/client.py list | upload <arquivo> | download <nome>"
+
+FRIENDLY_MESSAGES = {
+    grpc.StatusCode.UNAVAILABLE: f"Servidor indisponível em {ADDRESS}. Verifique se ele está rodando.",
+    grpc.StatusCode.DEADLINE_EXCEEDED: "Tempo limite da operação excedido.",
+    grpc.StatusCode.CANCELLED: "Operação cancelada.",
+}
 
 logger = logging.getLogger("client")
 
@@ -23,9 +30,6 @@ def list_files(stub):
     start = time.perf_counter()
     log_event(logger, "list.request", server=ADDRESS)
     response = stub.ListFiles(pb2.ListFilesRequest())
-    if not response.status.success:
-        log_event(logger, "list.failed", logging.ERROR, reason=response.status.message)
-        return
     log_event(logger, "list.response", files=len(response.files), duration_ms=elapsed_ms(start))
     if not response.files:
         print("Nenhum arquivo disponível.")
@@ -36,8 +40,14 @@ def list_files(stub):
         print(f"{item.name:<40} {item.size_bytes:>16}  {modified}")
 
 
+class ClientError(Exception):
+    pass
+
+
 def upload(stub, file_path: Path):
     start = time.perf_counter()
+    if not file_path.is_file():
+        raise ClientError(f"Arquivo local não encontrado: {file_path}")
     digest = hashlib.sha256()
     size = file_path.stat().st_size
     with file_path.open("rb") as f:
@@ -62,20 +72,18 @@ def upload(stub, file_path: Path):
                 progress.update(sent)
 
     result = stub.Upload(requests())
-    if result.success:
-        log_event(
-            logger, "upload.done", filename=file_path.name, bytes=result.bytes_transferred,
-            sha256=result.sha256[:16], duration_ms=elapsed_ms(start),
-        )
-    else:
-        log_event(
-            logger, "upload.failed", logging.ERROR, filename=file_path.name,
-            reason=result.message, duration_ms=elapsed_ms(start),
-        )
+    if result.sha256.lower() != file_hash:
+        raise ClientError("O SHA-256 confirmado pelo servidor não confere com o local.")
+    log_event(
+        logger, "upload.done", filename=file_path.name, bytes=result.bytes_transferred,
+        sha256=result.sha256[:16], duration_ms=elapsed_ms(start),
+    )
 
 
 def download(stub, filename: str, output_dir=Path("downloads")):
     start = time.perf_counter()
+    if not filename or Path(filename).name != filename or filename in {".", ".."}:
+        raise ClientError("Nome de arquivo inválido: informe apenas o nome, sem diretórios.")
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / filename
     temp = destination.with_suffix(destination.suffix + ".part")
@@ -100,7 +108,7 @@ def download(stub, filename: str, output_dir=Path("downloads")):
                     )
                 elif kind == "chunk":
                     if metadata is None:
-                        raise RuntimeError("Chunk recebido antes dos metadados.")
+                        raise ClientError("Chunk recebido antes dos metadados.")
                     data = response.chunk.data
                     output.write(data)
                     digest.update(data)
@@ -109,44 +117,64 @@ def download(stub, filename: str, output_dir=Path("downloads")):
                 elif kind == "status":
                     status = response.status
                     if not status.success:
-                        raise RuntimeError(status.message)
+                        raise ClientError(status.message)
 
         if metadata is None:
-            raise RuntimeError("Metadados não recebidos.")
+            raise ClientError("Metadados não recebidos.")
         if received != metadata.size_bytes:
-            raise RuntimeError(f"Tamanho inválido: {received}/{metadata.size_bytes}.")
+            raise ClientError(f"Tamanho inválido: {received}/{metadata.size_bytes}.")
         if digest.hexdigest().lower() != metadata.sha256.lower():
-            raise RuntimeError("SHA-256 não confere.")
+            raise ClientError("SHA-256 não confere.")
         temp.replace(destination)
         log_event(
             logger, "download.done", filename=filename, path=destination, bytes=received,
             sha256_ok=True, duration_ms=elapsed_ms(start),
         )
-    except Exception as exc:
+    except BaseException:
         temp.unlink(missing_ok=True)
-        log_event(
-            logger, "download.failed", logging.ERROR, filename=filename, bytes=received,
-            reason=str(exc), duration_ms=elapsed_ms(start),
-        )
         raise
+
+
+def run(command, args):
+    with grpc.insecure_channel(ADDRESS) as channel:
+        stub = pb2_grpc.FileServiceStub(channel)
+        if command == "list" and not args:
+            list_files(stub)
+        elif command == "upload" and len(args) == 1:
+            upload(stub, Path(args[0]))
+        elif command == "download" and len(args) == 1:
+            download(stub, args[0])
+        else:
+            return False
+    return True
 
 
 def main():
     setup_logging("client")
     if len(sys.argv) < 2:
-        print("Use: python src/client.py list | upload <arquivo> | download <nome>")
-        return
-    with grpc.insecure_channel(ADDRESS) as channel:
-        stub = pb2_grpc.FileServiceStub(channel)
-        command = sys.argv[1]
-        if command == "list":
-            list_files(stub)
-        elif command == "upload" and len(sys.argv) == 3:
-            upload(stub, Path(sys.argv[2]))
-        elif command == "download" and len(sys.argv) == 3:
-            download(stub, sys.argv[2])
-        else:
-            print("Errou feio, errou rude. Comando inválido.")
+        print(USAGE)
+        return 2
+    command, args = sys.argv[1], sys.argv[2:]
+    try:
+        if not run(command, args):
+            print(USAGE)
+            return 2
+        return 0
+    except grpc.RpcError as exc:
+        code = exc.code()
+        message = FRIENDLY_MESSAGES.get(code, exc.details())
+        log_event(logger, f"{command}.failed", logging.ERROR, code=code.name, reason=message)
+        print(f"Erro [{code.name}]: {message}", file=sys.stderr)
+        return 1
+    except ClientError as exc:
+        log_event(logger, f"{command}.failed", logging.ERROR, code="CLIENT", reason=str(exc))
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        log_event(logger, f"{command}.cancelled", logging.WARNING)
+        print("Operação cancelada pelo usuário.", file=sys.stderr)
+        return 130
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

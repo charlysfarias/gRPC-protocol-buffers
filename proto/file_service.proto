@@ -20,7 +20,8 @@ message FileInfo {
 
 message ListFilesResponse {
   repeated FileInfo files = 1;
-  TransferStatus status = 2;
+  reserved 2;
+  reserved "status";
 }
 
 message UploadMetadata {
