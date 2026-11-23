@@ -1,4 +1,5 @@
 from concurrent import futures
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
@@ -24,6 +25,10 @@ CHUNK_SIZE = 64 * 1024
 MAX_FILE_SIZE = 100 * 1024 * 1024
 STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage"
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,199}$")
+SHA256_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
+TEMP_PREFIX = ".upload-"
+TEMP_SUFFIX = ".tmp"
+FILE_MODE = 0o644
 
 logger = logging.getLogger("server")
 
@@ -35,10 +40,25 @@ class TransferError(Exception):
         self.message = message
 
 
+@dataclass
+class FileEntry:
+    size: int
+    mtime: float
+    sha256: str | None = None
+
+
 def valid_filename(name):
     return bool(name and SAFE_NAME.fullmatch(name)
                 and name not in {".", ".."}
                 and "/" not in name and "\\" not in name)
+
+
+def sha256_of(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while data := source.read(CHUNK_SIZE):
+            digest.update(data)
+    return digest.hexdigest()
 
 
 def new_transfer_id():
@@ -59,55 +79,102 @@ class FileService(pb2_grpc.FileServiceServicer):
         self.storage_dir = storage_dir
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
-        self.index = {}
+        self.index: dict[str, FileEntry] = {}
+        self.reserved: set[str] = set()
+        self._remove_orphan_temp_files()
         self._rebuild_index()
+
+    def _remove_orphan_temp_files(self):
+        removed = 0
+        for path in self.storage_dir.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}"):
+            path.unlink(missing_ok=True)
+            removed += 1
+        if removed:
+            log_event(logger, "storage.orphans_removed", logging.WARNING, files=removed)
 
     def _rebuild_index(self):
         with self.lock:
+            self.index.clear()
             for path in self.storage_dir.iterdir():
                 if path.is_file() and valid_filename(path.name):
                     stat = path.stat()
-                    self.index[path.name] = {
-                        "size": stat.st_size,
-                        "mtime": stat.st_mtime,
-                    }
+                    self.index[path.name] = FileEntry(size=stat.st_size, mtime=stat.st_mtime)
         log_event(logger, "index.rebuilt", files=len(self.index))
 
-    def _refresh(self, name):
-        path = self.storage_dir / name
-        if path.is_file():
-            stat = path.stat()
-            self.index[name] = {"size": stat.st_size, "mtime": stat.st_mtime}
+    def _reserve(self, name):
+        with self.lock:
+            if name in self.index or name in self.reserved or (self.storage_dir / name).exists():
+                raise TransferError(grpc.StatusCode.ALREADY_EXISTS, "Já existe um arquivo com esse nome.")
+            self.reserved.add(name)
+
+    def _release(self, name):
+        with self.lock:
+            self.reserved.discard(name)
+
+    def _publish(self, temp_path, name, sha256):
+        destination = self.storage_dir / name
+        with self.lock:
+            os.replace(temp_path, destination)
+            stat = destination.stat()
+            self.index[name] = FileEntry(size=stat.st_size, mtime=stat.st_mtime, sha256=sha256)
+
+    def _lookup(self, name):
+        with self.lock:
+            entry = self.index.get(name)
+            if entry is None:
+                return None
+            if entry.sha256 is not None:
+                return FileEntry(entry.size, entry.mtime, entry.sha256)
+        file_hash = sha256_of(self.storage_dir / name)
+        with self.lock:
+            entry = self.index.get(name)
+            if entry is None:
+                return None
+            entry.sha256 = file_hash
+            return FileEntry(entry.size, entry.mtime, entry.sha256)
 
     def ListFiles(self, request, context):
         start = time.perf_counter()
         peer = context.peer()
         log_event(logger, "list.start", peer=peer)
+        with self.lock:
+            snapshot = sorted(
+                (name, FileEntry(e.size, e.mtime, e.sha256)) for name, e in self.index.items()
+            )
         response = pb2.ListFilesResponse()
         total_bytes = 0
-        with self.lock:
-            for name in sorted(self.index):
-                path = self.storage_dir / name
-                if not path.is_file():
-                    continue
-                stat = path.stat()
-                total_bytes += stat.st_size
-                info = response.files.add(name=name, size_bytes=stat.st_size)
-                info.modified_at.FromDatetime(
-                    datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-                )
+        for name, entry in snapshot:
+            total_bytes += entry.size
+            info = response.files.add(name=name, size_bytes=entry.size)
+            info.modified_at.FromDatetime(datetime.fromtimestamp(entry.mtime, tz=timezone.utc))
         log_event(
             logger, "list.done", peer=peer, files=len(response.files),
             total_bytes=total_bytes, duration_ms=elapsed_ms(start),
         )
         return response
 
+    def _validate_metadata(self, metadata):
+        if not valid_filename(metadata.filename):
+            raise TransferError(grpc.StatusCode.INVALID_ARGUMENT, "Nome de arquivo inválido.")
+        if not SHA256_HEX.fullmatch(metadata.sha256):
+            raise TransferError(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "SHA-256 obrigatório: informe 64 caracteres hexadecimais.",
+            )
+        if metadata.expected_size > MAX_FILE_SIZE:
+            raise TransferError(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                f"Arquivo excede o tamanho máximo de {MAX_FILE_SIZE} bytes.",
+            )
+
     def Upload(self, request_iterator, context):
         transfer_id = new_transfer_id()
         peer = context.peer()
         start = time.perf_counter()
         metadata = None
+        reserved_name = None
         temp_path = None
+        output = None
         progress = None
         total = 0
         chunks = 0
@@ -129,20 +196,14 @@ class FileService(pb2_grpc.FileServiceServicer):
                         logger, "upload.start", transfer=transfer_id, peer=peer,
                         filename=metadata.filename, expected_size=metadata.expected_size,
                     )
-                    if not valid_filename(metadata.filename):
-                        raise TransferError(grpc.StatusCode.INVALID_ARGUMENT, "Nome de arquivo inválido.")
-                    if metadata.expected_size > MAX_FILE_SIZE:
-                        raise TransferError(
-                            grpc.StatusCode.RESOURCE_EXHAUSTED,
-                            f"Arquivo excede o tamanho máximo de {MAX_FILE_SIZE} bytes.",
-                        )
-                    if (self.storage_dir / metadata.filename).exists():
-                        raise TransferError(grpc.StatusCode.ALREADY_EXISTS, "Já existe um arquivo com esse nome.")
+                    self._validate_metadata(metadata)
+                    self._reserve(metadata.filename)
+                    reserved_name = metadata.filename
                     fd, temp_name = tempfile.mkstemp(
-                        prefix=".upload-", suffix=".tmp", dir=self.storage_dir
+                        prefix=TEMP_PREFIX, suffix=TEMP_SUFFIX, dir=self.storage_dir
                     )
-                    os.close(fd)
                     temp_path = Path(temp_name)
+                    output = os.fdopen(fd, "wb")
                     progress = ProgressLogger(
                         logger, "upload.progress", metadata.expected_size,
                         transfer=transfer_id, filename=metadata.filename,
@@ -168,29 +229,28 @@ class FileService(pb2_grpc.FileServiceServicer):
                         grpc.StatusCode.INVALID_ARGUMENT,
                         f"Recebidos mais bytes que o declarado ({metadata.expected_size}).",
                     )
-                with temp_path.open("ab") as output:
-                    output.write(chunk)
+                output.write(chunk)
                 digest.update(chunk)
                 progress.update(total)
 
             if metadata is None:
                 raise TransferError(grpc.StatusCode.INVALID_ARGUMENT, "Stream vazio: metadados ausentes.")
-            actual_hash = digest.hexdigest()
             if total != metadata.expected_size:
                 raise TransferError(
                     grpc.StatusCode.DATA_LOSS,
                     f"Tamanho divergente: esperado {metadata.expected_size}, recebido {total}.",
                 )
-            if metadata.sha256 and actual_hash.lower() != metadata.sha256.lower():
+            actual_hash = digest.hexdigest()
+            if actual_hash != metadata.sha256.lower():
                 raise TransferError(grpc.StatusCode.DATA_LOSS, "Falha na verificação SHA-256.")
 
-            destination = self.storage_dir / metadata.filename
-            with self.lock:
-                if destination.exists():
-                    raise TransferError(grpc.StatusCode.ALREADY_EXISTS, "Já existe um arquivo com esse nome.")
-                os.replace(temp_path, destination)
-                temp_path = None
-                self._refresh(metadata.filename)
+            output.flush()
+            os.fsync(output.fileno())
+            output.close()
+            output = None
+            os.chmod(temp_path, FILE_MODE)
+            self._publish(temp_path, metadata.filename, actual_hash)
+            temp_path = None
 
             log_event(
                 logger, "upload.done", transfer=transfer_id, peer=peer,
@@ -218,9 +278,13 @@ class FileService(pb2_grpc.FileServiceServicer):
             )
             error = TransferError(grpc.StatusCode.INTERNAL, "Erro interno ao processar o upload.")
         finally:
-            if temp_path and temp_path.exists():
+            if output is not None:
+                output.close()
+            if temp_path is not None and temp_path.exists():
                 temp_path.unlink(missing_ok=True)
                 log_event(logger, "upload.tempfile_removed", transfer=transfer_id, path=temp_path.name)
+            if reserved_name is not None:
+                self._release(reserved_name)
 
         log_event(
             logger, "upload.rejected", logging.WARNING, transfer=transfer_id, peer=peer,
@@ -245,35 +309,25 @@ class FileService(pb2_grpc.FileServiceServicer):
         if not valid_filename(request.filename):
             abort(grpc.StatusCode.INVALID_ARGUMENT, "Nome de arquivo inválido.")
 
-        path = self.storage_dir / request.filename
-        if not path.is_file():
+        try:
+            entry = self._lookup(request.filename)
+        except FileNotFoundError:
+            entry = None
+        if entry is None:
             abort(grpc.StatusCode.NOT_FOUND, "Arquivo inexistente.")
 
-        size = path.stat().st_size
-        if size > MAX_FILE_SIZE:
-            abort(
-                grpc.StatusCode.RESOURCE_EXHAUSTED,
-                f"Arquivo excede o tamanho máximo de {MAX_FILE_SIZE} bytes.",
-            )
-
-        digest = hashlib.sha256()
-        with path.open("rb") as source:
-            while data := source.read(CHUNK_SIZE):
-                digest.update(data)
-        file_hash = digest.hexdigest()
-
+        path = self.storage_dir / request.filename
         sent = 0
         chunks = 0
         finished = False
         progress = ProgressLogger(
-            logger, "download.progress", size, transfer=transfer_id, filename=path.name,
+            logger, "download.progress", entry.size, transfer=transfer_id, filename=path.name,
         )
         try:
-            yield pb2.DownloadResponse(metadata=pb2.DownloadMetadata(
-                filename=path.name, size_bytes=size, sha256=file_hash
-            ))
-
             with path.open("rb") as source:
+                yield pb2.DownloadResponse(metadata=pb2.DownloadMetadata(
+                    filename=path.name, size_bytes=entry.size, sha256=entry.sha256
+                ))
                 while data := source.read(CHUNK_SIZE):
                     sent += len(data)
                     chunks += 1
@@ -281,13 +335,13 @@ class FileService(pb2_grpc.FileServiceServicer):
                     progress.update(sent)
 
             yield pb2.DownloadResponse(status=pb2.TransferStatus(
-                success=(sent == size), message="Download concluído.",
-                bytes_transferred=sent, sha256=file_hash
+                success=(sent == entry.size), message="Download concluído.",
+                bytes_transferred=sent, sha256=entry.sha256
             ))
             finished = True
             log_event(
                 logger, "download.done", transfer=transfer_id, peer=peer,
-                filename=path.name, bytes=sent, chunks=chunks, sha256=file_hash[:16],
+                filename=path.name, bytes=sent, chunks=chunks, sha256=entry.sha256[:16],
                 duration_ms=elapsed_ms(start), mib_s=throughput_mib_s(sent, start),
             )
         except OSError as exc:
@@ -301,7 +355,7 @@ class FileService(pb2_grpc.FileServiceServicer):
             if not finished:
                 log_event(
                     logger, "download.cancelled", logging.WARNING, transfer=transfer_id,
-                    peer=peer, filename=path.name, bytes=sent, total=size,
+                    peer=peer, filename=path.name, bytes=sent, total=entry.size,
                     duration_ms=elapsed_ms(start),
                 )
 
