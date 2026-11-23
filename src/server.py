@@ -1,4 +1,5 @@
 from concurrent import futures
+import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7,6 +8,7 @@ import logging
 import os
 import re
 import signal
+import sys
 import tempfile
 import threading
 import time
@@ -18,12 +20,15 @@ import file_service_pb2 as pb2
 import file_service_pb2_grpc as pb2_grpc
 from log_config import ProgressLogger, log_event, setup_logging
 
-HOST = "0.0.0.0"
-PORT = 50051
-MAX_WORKERS = 10
+DEFAULT_HOST = os.environ.get("FILESERVER_HOST", "0.0.0.0")
+DEFAULT_PORT = int(os.environ.get("FILESERVER_PORT", "50051"))
+DEFAULT_WORKERS = int(os.environ.get("FILESERVER_WORKERS", "10"))
+DEFAULT_MAX_FILE_MB = int(os.environ.get("FILESERVER_MAX_FILE_MB", "100"))
+DEFAULT_STORAGE_DIR = Path(
+    os.environ.get("FILESERVER_STORAGE", Path(__file__).resolve().parent.parent / "storage")
+)
 CHUNK_SIZE = 64 * 1024
-MAX_FILE_SIZE = 100 * 1024 * 1024
-STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage"
+GRACE_SECONDS = 5
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,199}$")
 SHA256_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
 TEMP_PREFIX = ".upload-"
@@ -75,8 +80,9 @@ def throughput_mib_s(size, start):
 
 
 class FileService(pb2_grpc.FileServiceServicer):
-    def __init__(self, storage_dir):
+    def __init__(self, storage_dir, max_file_size):
         self.storage_dir = storage_dir
+        self.max_file_size = max_file_size
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.index: dict[str, FileEntry] = {}
@@ -161,10 +167,10 @@ class FileService(pb2_grpc.FileServiceServicer):
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "SHA-256 obrigatório: informe 64 caracteres hexadecimais.",
             )
-        if metadata.expected_size > MAX_FILE_SIZE:
+        if metadata.expected_size > self.max_file_size:
             raise TransferError(
                 grpc.StatusCode.RESOURCE_EXHAUSTED,
-                f"Arquivo excede o tamanho máximo de {MAX_FILE_SIZE} bytes.",
+                f"Arquivo excede o tamanho máximo de {self.max_file_size} bytes.",
             )
 
     def Upload(self, request_iterator, context):
@@ -219,10 +225,10 @@ class FileService(pb2_grpc.FileServiceServicer):
                 chunk = request.chunk.data
                 total += len(chunk)
                 chunks += 1
-                if total > MAX_FILE_SIZE:
+                if total > self.max_file_size:
                     raise TransferError(
                         grpc.StatusCode.RESOURCE_EXHAUSTED,
-                        f"Arquivo excede o tamanho máximo de {MAX_FILE_SIZE} bytes.",
+                        f"Arquivo excede o tamanho máximo de {self.max_file_size} bytes.",
                     )
                 if total > metadata.expected_size:
                     raise TransferError(
@@ -360,29 +366,86 @@ class FileService(pb2_grpc.FileServiceServicer):
                 )
 
 
-def serve():
-    setup_logging("server")
-    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+def positive_int(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("deve ser maior que zero")
+    return number
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="server.py",
+        description="Servidor gRPC de transferência de arquivos (Equipe 08).",
+    )
+    parser.add_argument(
+        "--host", default=DEFAULT_HOST,
+        help="interface de escuta (padrão: %(default)s; env FILESERVER_HOST)",
+    )
+    parser.add_argument(
+        "-p", "--port", type=positive_int, default=DEFAULT_PORT,
+        help="porta TCP (padrão: %(default)s; env FILESERVER_PORT)",
+    )
+    parser.add_argument(
+        "-w", "--workers", type=positive_int, default=DEFAULT_WORKERS,
+        help="threads do pool que atendem chamadas simultâneas (padrão: %(default)s; env FILESERVER_WORKERS)",
+    )
+    parser.add_argument(
+        "--max-concurrent", type=positive_int, default=None,
+        help="máximo de chamadas simultâneas; excedentes recebem RESOURCE_EXHAUSTED (padrão: igual a --workers)",
+    )
+    parser.add_argument(
+        "--max-file-mb", type=positive_int, default=DEFAULT_MAX_FILE_MB,
+        help="tamanho máximo por arquivo em MiB (padrão: %(default)s; env FILESERVER_MAX_FILE_MB)",
+    )
+    parser.add_argument(
+        "--storage", type=Path, default=DEFAULT_STORAGE_DIR,
+        help="pasta de armazenamento (padrão: %(default)s; env FILESERVER_STORAGE)",
+    )
+    parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="nível de log (padrão: %(default)s)",
+    )
+    return parser
+
+
+def serve(argv=None):
+    args = build_parser().parse_args(argv)
+    setup_logging("server", getattr(logging, args.log_level))
+    max_concurrent = args.max_concurrent or args.workers
+    max_file_size = args.max_file_mb * 1024 * 1024
+    storage_dir = args.storage.resolve()
+
     server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="worker")
+        futures.ThreadPoolExecutor(max_workers=args.workers, thread_name_prefix="worker"),
+        maximum_concurrent_rpcs=max_concurrent,
+        options=[("grpc.so_reuseport", 0)],
     )
-    pb2_grpc.add_FileServiceServicer_to_server(
-        FileService(STORAGE_DIR), server
-    )
-    server.add_insecure_port(f"{HOST}:{PORT}")
+    pb2_grpc.add_FileServiceServicer_to_server(FileService(storage_dir, max_file_size), server)
+    address = f"{args.host}:{args.port}"
+    try:
+        bound_port = server.add_insecure_port(address)
+    except RuntimeError:
+        bound_port = 0
+    if bound_port == 0:
+        log_event(logger, "server.bind_failed", logging.ERROR, address=address)
+        print(f"Erro: não foi possível escutar em {address}. A porta já está em uso?", file=sys.stderr)
+        return 1
     server.start()
     log_event(
-        logger, "server.started", host=HOST, port=PORT, workers=MAX_WORKERS,
-        chunk_size=CHUNK_SIZE, max_file_size=MAX_FILE_SIZE, storage=STORAGE_DIR,
+        logger, "server.started", host=args.host, port=args.port, workers=args.workers,
+        max_concurrent=max_concurrent, chunk_size=CHUNK_SIZE, max_file_size=max_file_size,
+        storage=storage_dir,
     )
     stop_requested = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda signum, frame: stop_requested.set())
     stop_requested.wait()
-    log_event(logger, "server.stopping", grace_s=5)
-    server.stop(grace=5).wait()
+    log_event(logger, "server.stopping", grace_s=GRACE_SECONDS)
+    server.stop(grace=GRACE_SECONDS).wait()
     log_event(logger, "server.stopped")
+    return 0
 
 
 if __name__ == "__main__":
-    serve()
+    sys.exit(serve())
