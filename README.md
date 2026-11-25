@@ -4,7 +4,7 @@ Projeto da disciplina **CIN0143 — Introdução aos Sistemas Distribuídos e Re
 
 Sistema distribuído cliente-servidor para armazenar, listar, enviar e baixar arquivos usando **gRPC** com **Protocol Buffers**. O upload usa *client-side streaming*, o download usa *server-side streaming*, e cada transferência é fragmentada em chunks e verificada por SHA-256 nas duas pontas.
 
-> **Estado atual: Entrega 2 (Comunicação e Core).** Servidor e cliente de terminal funcionais, atendimento concorrente, logs estruturados e script de teste de concorrência. Interface gráfica e testes de carga ficam para as próximas entregas (ver [Roadmap](#13-roadmap)).
+> **Estado atual: Entrega 3 (Interface Gráfica).** Servidor concorrente, cliente de terminal, interface gráfica em Tkinter com barra de progresso em tempo real, logs estruturados e testes de concorrência.
 
 ## Sumário
 
@@ -31,23 +31,23 @@ Sistema distribuído cliente-servidor para armazenar, listar, enviar e baixar ar
 | **gRPC** (tecnologia sugerida) | Os três requisitos do tema são modos nativos do gRPC: chamada unária (listagem), *client streaming* (upload) e *server streaming* (download). O fluxo de chunks fica declarado no próprio contrato, sem protocolo de framing escrito à mão. |
 | **Protocol Buffers** | Serialização binária compacta. O campo `bytes` carrega o conteúdo cru do arquivo; em JSON seria preciso Base64, cerca de 33% a mais por chunk. O `.proto` é um contrato tipado do qual se geram os stubs de cliente e servidor. |
 | **HTTP/2** (transporte do gRPC) | Multiplexação: várias transferências simultâneas trafegam como *streams* independentes numa única conexão TCP. Também traz controle de fluxo (*backpressure*), *deadlines* e cancelamento propagados entre cliente e servidor. |
-| **Python 3.10+** com `grpcio` | Implementação oficial do gRPC, geração de stubs com `grpcio-tools`, e bibliotecas padrão suficientes para o domínio (`hashlib`, `pathlib`, `tempfile`, `threading`, `logging`). É a linguagem que toda a equipe domina, o que reduz o risco do cronograma. |
+| **Python 3.10+** com `grpcio` e `tkinter` | Implementação oficial do gRPC, geração de stubs com `grpcio-tools`, e bibliotecas padrão suficientes para o domínio (`hashlib`, `pathlib`, `tempfile`, `threading`, `logging`) e interface gráfica (`tkinter`/`ttk`), permitindo importar os stubs diretamente sem proxy intermediário. |
 
-**Alternativas consideradas:** REST com `multipart/form-data` não tem contrato de streaming tipado e exigiria Range/Chunked feitos à mão. WebSockets não têm contrato nem códigos de status padronizados. gRPC em Go teria desempenho melhor, mas com curva de aprendizado maior para a equipe.
+**Alternativas consideradas:** REST com `multipart/form-data` não tem contrato de streaming tipado e exigiria Range/Chunked feitos à mão. WebSockets não têm contrato nem códigos de status padronizados. Frontend web SPA exigiria configurar um proxy Envoy ou servidor intermediário para traduzir HTTP/REST para gRPC.
 
 ## 2. Arquitetura
 
 ```text
                       gRPC sobre HTTP/2 (TCP :50051)
 +--------------------+                                +------------------------------+
-| Cliente (terminal) |  ListFiles   (unária)  ----->  | Servidor gRPC                |
+| Cliente (CLI / GUI)|  ListFiles   (unária)  ----->  | Servidor gRPC                |
 |  src/client.py     |  <-----  ListFilesResponse     |  src/server.py               |
-|                    |                                |                              |
+|  src/gui.py        |                                |                              |
 |  - calcula SHA-256 |  Upload  (client streaming)    |  FileService                 |
 |  - fragmenta 64KiB |  metadata, chunk, chunk ... -> |   - valida nome/tamanho/hash |
-|  - verifica hash   |  <-----  TransferStatus        |   - reserva nome             |
-|    no download     |                                |   - grava .tmp + fsync       |
-|                    |  Download (server streaming)   |   - publica com os.replace   |
+|  - progresso/chunk |  <-----  TransferStatus        |   - reserva nome             |
+|  - verifica hash   |                                |   - grava .tmp + fsync       |
+|    no download     |  Download (server streaming)   |   - publica com os.replace   |
 |                    |  <- metadata, chunk ..., status|   - logs estruturados        |
 +--------------------+                                +--------------+---------------+
                                                                      |
@@ -67,7 +67,8 @@ Sistema distribuído cliente-servidor para armazenar, listar, enviar e baixar ar
 **Responsabilidades**
 
 - **Servidor (`src/server.py`):** expõe o serviço `FileService` e é o único dono da pasta `storage/`. Valida as requisições, mantém o índice em memória, recebe e envia chunks e registra logs de cada chamada.
-- **Cliente (`src/client.py`):** CLI com os comandos `list`, `upload` e `download`. Calcula o SHA-256 antes do envio e confere o hash e o tamanho no download antes de gravar o arquivo final.
+- **Interface Gráfica (`src/gui.py`):** aplicação desktop em Tkinter que exibe o explorador de arquivos do servidor, executa chamadas gRPC em *threads* separadas para não bloquear a interface, atualiza barras de progresso por chunk e apresenta mensagens visuais de erro.
+- **Cliente de Terminal (`src/client.py`):** CLI com os comandos `list`, `upload` e `download`. Calcula o SHA-256 antes do envio e confere o hash e o tamanho no download antes de gravar o arquivo final.
 - **Logs (`src/log_config.py`):** formato de log `chave=valor` comum a servidor, cliente e testes.
 - **Contrato (`proto/file_service.proto`):** fonte única de verdade das mensagens e RPCs. Os stubs `file_service_pb2*.py` são gerados a partir dele.
 
@@ -142,15 +143,16 @@ A ordem dos chunks é garantida pelo próprio gRPC: dentro de um stream HTTP/2 a
 | Servidor fora do ar | `UNAVAILABLE` |
 | Falha inesperada de disco | `INTERNAL` (o log do servidor guarda o traceback) |
 
-O cliente mostra uma mensagem curta (`Erro [NOT_FOUND]: Arquivo inexistente.`) e termina com código de saída `0` (sucesso), `1` (erro), `2` (uso incorreto) ou `130` (Ctrl+C).
+No cliente de terminal, erros exibem mensagem curta (`Erro [NOT_FOUND]: Arquivo inexistente.`) com código de saída `0` (sucesso), `1` (erro), `2` (uso incorreto) ou `130` (Ctrl+C). Na interface gráfica, os erros são exibidos na barra de status inferior e nomes enviados passam por sanitização prévia para compatibilidade com a expressão regular do servidor.
 
 ## 7. Concorrência
 
-- **Modelo de execução:** o servidor usa um `ThreadPoolExecutor` com `--workers` threads (padrão 10). Cada RPC de streaming ocupa uma thread do início ao fim da transferência, então até `--workers` transferências rodam em paralelo.
+- **Modelo de execução no servidor:** usa um `ThreadPoolExecutor` com `--workers` threads (padrão 10). Cada RPC de streaming ocupa uma thread do início ao fim da transferência, então até `--workers` transferências rodam em paralelo.
 - **Limite de chamadas:** `--max-concurrent` (padrão: igual a `--workers`) limita quantas chamadas o servidor aceita no total.
   - Chamadas além do limite recebem `RESOURCE_EXHAUSTED` imediatamente, em vez de ficarem esperando sem aviso.
   - Com `--max-concurrent` maior que `--workers`, as excedentes esperam numa fila por uma thread livre.
-- **Disputa pelo mesmo nome:** é resolvida pela reserva do nome (seção 5). Exatamente um cliente vence.
+- **Disputa pelo mesmo nome:** é resolvida pela reserva do nome (seção 5). Exatamente um cliente vence; downloads paralelos de um mesmo arquivo permanecem liberados.
+- **Concorrência na interface gráfica:** as operações de rede em `src/gui.py` rodam em *threads* secundárias (`threading.Thread`) e atualizam componentes visuais via `root.after(0, ...)`, mantendo a interface responsiva durante transferências.
 - **Cancelamento e deadline:** se o cliente desiste ou o prazo estoura, o servidor detecta, registra `upload.cancelled` ou `download.cancelled`, apaga o temporário e libera o nome reservado.
 - **Porta exclusiva:** o servidor desativa `SO_REUSEPORT`. Sem isso, o gRPC permitiria que um segundo processo escutasse na mesma porta, e cada um teria o próprio índice, deixando os dados inconsistentes. Agora o segundo processo falha com "A porta já está em uso?".
 - **Encerramento gracioso:** Ctrl+C ou `SIGTERM` param de aceitar novas chamadas e dão 5 s para as transferências em andamento terminarem.
@@ -191,20 +193,29 @@ gRPC-protocol-buffers/
 ├── src/
 │   ├── server.py                 # servidor gRPC (FileService)
 │   ├── client.py                 # cliente de terminal (list/upload/download)
+│   ├── gui.py                    # interface gráfica desktop (Tkinter)
 │   ├── log_config.py             # formato de log compartilhado
 │   ├── file_service_pb2.py       # gerado pelo protoc (não versionado)
 │   └── file_service_pb2_grpc.py  # gerado pelo protoc (não versionado)
 ├── tests/
 │   └── concurrency_test.py       # N clientes simultâneos + verificação de integridade
 ├── storage/                      # criado pelo servidor (não versionado)
-├── downloads/                    # criado pelo cliente (não versionado)
+├── downloads/                    # criado pelo cliente CLI (não versionado)
 ├── requirements.txt
 └── README.md
 ```
 
 ## 10. Instalação
 
-Requisitos: **Python 3.10 ou superior** (confira com `python3 --version`).
+Requisitos: **Python 3.10 ou superior** (confira com `python3 --version`) e **Tkinter** para a interface gráfica.
+
+Em sistemas Debian/Ubuntu/Pop!_OS, instale o pacote gráfico do Python caso ainda não esteja presente:
+
+```bash
+sudo apt update && sudo apt install -y python3-tk
+```
+
+Clone o repositório e instale as dependências Python:
 
 ```bash
 git clone https://github.com/charlysfarias/gRPC-protocol-buffers.git
@@ -253,7 +264,20 @@ Exemplo: `python src/server.py -p 6000 -w 20 --max-concurrent 50 --storage /tmp/
 
 Para encerrar: **Ctrl+C**.
 
-### Cliente
+### Interface Gráfica (GUI)
+
+Com o servidor em execução, abra a interface gráfica em outro terminal:
+
+```bash
+python src/gui.py
+```
+
+Na janela:
+- **Servidor / Atualizar Lista:** conecta ao endereço informado (padrão `localhost:50051`) e preenche a tabela com nome, tamanho e data de modificação dos arquivos.
+- **Enviar Arquivo (Upload):** abre o seletor de arquivos local, calcula o SHA-256, envia em chunks de 64 KiB via *client-side streaming* atualizando a barra de progresso e atualiza a listagem ao concluir.
+- **Baixar Selecionado (Download):** baixa o arquivo selecionado na tabela via *server-side streaming* atualizando a barra de progresso, verifica o SHA-256 e salva no destino escolhido pelo usuário.
+
+### Cliente de Terminal (CLI)
 
 As opções globais vêm **antes** do comando:
 
@@ -275,7 +299,7 @@ python src/client.py [-s HOST:PORTA] [-t SEGUNDOS] [--log-level NIVEL] COMANDO .
 
 ### Em duas máquinas
 
-Na máquina do servidor, descubra o IP (`ipconfig getifaddr en0` no macOS, `hostname -I` no Linux) e rode `python src/server.py`. Na outra máquina, na mesma rede:
+Na máquina do servidor, descubra o IP (`ipconfig getifaddr en0` no macOS, `hostname -I` no Linux) e rode `python src/server.py`. Na outra máquina, na mesma rede, informe `192.168.0.10:50051` no campo de servidor da interface gráfica ou rode:
 
 ```bash
 python src/client.py -s 192.168.0.10:50051 list
@@ -285,7 +309,15 @@ O firewall precisa permitir a porta 50051.
 
 ## 12. Testes
 
-### 12.1 Roteiro manual
+### 12.1 Demonstração pela Interface Gráfica (Clientes Simultâneos)
+
+1. Inicie o servidor em um terminal (`python src/server.py`).
+2. Abra duas instâncias da interface gráfica em terminais separados (`python src/gui.py`).
+3. **Upload e atualização:** envie um arquivo pela primeira janela e clique em **Atualizar Lista** na segunda janela para visualizá-lo.
+4. **Downloads paralelos:** selecione o mesmo arquivo nas duas janelas e clique em **Baixar Selecionado (Download)** simultaneamente; ambas as transferências ocorrem em paralelo sem bloqueio.
+5. **Colisão de escrita:** tente enviar dois arquivos com o mesmo nome simultaneamente nas duas janelas (ou reenvie um arquivo já existente); o servidor rejeita a colisão com `ALREADY_EXISTS` e a interface exibe a mensagem de erro.
+
+### 12.2 Roteiro manual (CLI)
 
 Com o servidor rodando em um terminal, execute no outro:
 
@@ -321,7 +353,7 @@ python src/client.py -s localhost:59999 list
 
 **Cancelamento:** pressione Ctrl+C no meio do upload de um arquivo grande. O servidor registra `upload.cancelled` e não deixa `.tmp` em `storage/`.
 
-### 12.2 Teste de concorrência
+### 12.3 Teste automatizado de concorrência
 
 `tests/concurrency_test.py` dispara N clientes **ao mesmo tempo** (sincronizados por uma `threading.Barrier`). Cada um envia um arquivo aleatório, baixa de volta e confere o SHA-256. Ao final, o script mostra tempos (mínimo, média, p95, máximo), vazão agregada e **APROVADO** ou **REPROVADO** (código de saída `0` ou `1`).
 
@@ -369,7 +401,7 @@ Os arquivos de teste ficam em `storage/` com o prefixo `loadtest-`. Para limpar,
 |---|---|---|
 | 1 — Arquitetura e escopo | Tecnologia justificada, `.proto`, chunking e integridade, estado central, validações, servidor base em porta fixa | ✅ Concluída |
 | 2 — Comunicação e core | Listagem, upload e download funcionais, cliente de terminal, concorrência, logs estruturados, códigos de status gRPC, configuração por CLI, teste de concorrência | ✅ Concluída |
-| 3 — Evolução | Interface gráfica e testes de carga (por exemplo, com [`ghz`](https://ghz.sh)) | ⏳ Planejada |
+| 3 — Interface gráfica | Explorador de arquivos, upload e download com progresso em tempo real, travas contra colisão de escrita e tratamento visual de erros | ✅ Concluída |
 | 4 — Apresentação | Demonstração final | ⏳ 01 e 03/12/2026 |
 
 **Limitações conhecidas:**
